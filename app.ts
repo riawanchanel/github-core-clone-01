@@ -197,7 +197,7 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL, ma
   const body = await readBody(req);
 
   if (action === 'git-receive-pack') {
-    const outcome = receivePack(repo, body);
+    const outcome = await receivePack(repo, body);
     sendBuffer(res, outcome.status, outcome.body, 'application/x-git-receive-pack-result');
     return;
   }

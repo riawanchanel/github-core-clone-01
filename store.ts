@@ -225,10 +225,24 @@ export function reachableCommits(tips: readonly string[], treatAsParentless?: Re
   return seen;
 }
 
-/** Whether `ancestor` is reachable from `descendant` (a fast-forward test). */
+/** Whether `ancestor` is reachable from `descendant` (a fast-forward test). BFS with early exit. */
 export function isAncestor(ancestor: string, descendant: string): boolean {
   if (ancestor === descendant) return true;
-  return reachableCommits([descendant]).has(ancestor);
+  const seen = new Set<string>([descendant]);
+  const queue = [descendant];
+  while (queue.length > 0) {
+    const sha = queue.shift()!;
+    const commit = parseCommit(sha);
+    if (commit === null) continue;
+    for (const parent of commit.parents) {
+      if (parent === ancestor) return true;
+      if (!seen.has(parent)) {
+        seen.add(parent);
+        queue.push(parent);
+      }
+    }
+  }
+  return false;
 }
 
 /** The best common ancestor of two commits (first found by BFS from `a`), or null. */

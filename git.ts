@@ -3,7 +3,7 @@
 // model lives in store.ts; this file is the wire.
 
 import { createHash } from 'node:crypto';
-import { deflateSync, inflateSync } from 'node:zlib';
+import { createInflate, deflateSync } from 'node:zlib';
 import {
   ZERO_OID,
   getObject,
@@ -72,43 +72,22 @@ export function packetLines(packets: readonly Packet[]): string[] {
 
 // ---------------------------------------------------------------- packfiles
 
-/** Inflate one zlib stream starting at `offset`; returns the data and the offset just past the stream. */
-function inflateAt(buf: Buffer, offset: number): { data: Buffer; next: number } {
-  const tryEnd = (end: number): Buffer | null => {
-    try {
-      return inflateSync(buf.subarray(offset, end));
-    } catch {
-      return null;
-    }
-  };
-  // Exponential search for a succeeding end, then binary search for the smallest one:
-  // inflateSync tolerates trailing bytes, so success is monotone in the end offset.
-  let step = 64;
-  let failEnd = offset;
-  let okEnd = -1;
-  while (offset + step <= buf.length) {
-    if (tryEnd(offset + step) !== null) {
-      okEnd = offset + step;
-      break;
-    }
-    failEnd = offset + step;
-    step *= 4;
-  }
-  if (okEnd === -1) {
-    const data = tryEnd(buf.length);
-    if (data === null) throw new Error('pack entry does not inflate');
-    okEnd = buf.length;
-  }
-  let lo = failEnd + 1;
-  let hi = okEnd;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (tryEnd(mid) !== null) hi = mid;
-    else lo = mid + 1;
-  }
-  const data = tryEnd(lo);
-  if (data === null) throw new Error('pack entry does not inflate');
-  return { data, next: lo };
+/**
+ * Inflate one zlib stream starting at `offset`; returns the data and the offset just past the
+ * stream. The streaming inflater reports exactly how many input bytes it consumed, which the
+ * synchronous API cannot — that precision is what pack walking needs.
+ */
+function inflateAt(buf: Buffer, offset: number): Promise<{ data: Buffer; next: number }> {
+  return new Promise((resolve, reject) => {
+    const inflater = createInflate();
+    const chunks: Buffer[] = [];
+    inflater.on('data', (chunk: Buffer) => chunks.push(chunk));
+    inflater.on('end', () => {
+      resolve({ data: Buffer.concat(chunks), next: offset + (inflater as unknown as { bytesWritten: number }).bytesWritten });
+    });
+    inflater.on('error', (error: Error) => reject(new Error(`pack entry does not inflate: ${error.message}`)));
+    inflater.end(buf.subarray(offset));
+  });
 }
 
 function applyDelta(base: Buffer, delta: Buffer): Buffer {
@@ -174,7 +153,7 @@ interface PackEntry {
  * Read a packfile, store every object it carries, and return the stored entries.
  * Deltas are resolved against the pack itself or the object store (thin packs).
  */
-export function readPack(pack: Buffer): PackEntry[] {
+export async function readPack(pack: Buffer): Promise<PackEntry[]> {
   if (pack.length < 12 + 20 || pack.toString('ascii', 0, 4) !== 'PACK') throw new Error('not a packfile');
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`pack version ${version}`);
@@ -211,7 +190,7 @@ export function readPack(pack: Buffer): PackEntry[] {
       baseSha = pack.toString('hex', offset, offset + 20);
       offset += 20;
     }
-    const inflated = inflateAt(pack, offset);
+    const inflated = await inflateAt(pack, offset);
     if (inflated.data.length !== size) throw new Error('pack entry size mismatch');
     offset = inflated.next;
     raw.push({ typeId, data: inflated.data, baseOffset, baseSha });
@@ -672,7 +651,7 @@ export interface PushOutcome {
 }
 
 /** Handle one receive-pack POST body. Never throws: a malformed body is a 400. */
-export function receivePack(repo: RepoRec, body: Buffer): PushOutcome {
+export async function receivePack(repo: RepoRec, body: Buffer): Promise<PushOutcome> {
   let packets: Packet[];
   let next: number;
   try {
@@ -705,13 +684,10 @@ export function receivePack(repo: RepoRec, body: Buffer): PushOutcome {
   let unpackDetail = '';
   if (packBytes.length > 0) {
     try {
-      readPack(packBytes);
+      await readPack(packBytes);
     } catch (error) {
       unpackOk = false;
       unpackDetail = error instanceof Error ? error.message : String(error);
-      if (process.env.FORGE_DEBUG_PACKS === '1') {
-        import('node:fs').then((fs) => fs.writeFileSync(`/tmp/badpack-${Date.now()}.bin`, packBytes)).catch(() => undefined);
-      }
     }
   }
   const results: Array<{ ref: string; ok: boolean; reason: string }> = [];
